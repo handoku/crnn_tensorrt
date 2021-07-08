@@ -26,7 +26,7 @@ static Logger gLogger;
 const int DEVICE = 2;
 const std::string EngineName = "crnn.plan";
 const int maxBatchSize = 8;
-const std::string WeightName = "../crnn.wts";
+const std::string WeightName = "crnn.wts";
 const std::string InputNames[] = {"INPUT__0"};
 const std::string OutputNames[] = {"OUTPUT__0", "OUTPUT__1"};
 const int NumClasses = 6625; // 6624 + 1(blank)
@@ -662,7 +662,7 @@ void constructNetwork(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition*
     ///****/ dynamic reshape: [n*seqlen, NumClasses, 1, 1] -> [n, seqlen, NumClasses]
     auto sfl_3 = network->addShuffle(*x->getOutput(0));
     sfl_3->setName("sfl_3");
-    sfl_3->setReshapeDimensions(Dims3{-1, seqlen, NumClasses}); //static reshape
+    sfl_3->setReshapeDimensions(Dims3{-1, seqlen, NumClasses}); //static reshape for debug
 
     ITensor* const_num_classes_ts = addSingleIntValueConst(network, weightMap, NumClasses, "const_num_classes_ts")->getOutput(0);
     std::array<ITensor*, 2> shape_tensors = {{batch_seqlen_tensor, const_num_classes_ts}};
@@ -681,7 +681,7 @@ void constructNetwork(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition*
     // OUTPUT__0 : idx, shape : [n, seqlen, 1] -> [n, seqlen]
     auto sf = network->addShuffle(*top_1->getOutput(1));
     sf->setName("sf");
-    sf->setReshapeDimensions(Dims2{-1, seqlen}); // static reshape
+    sf->setReshapeDimensions(Dims2{-1, seqlen}); // static reshape for debug
 
     // dynamic reshape
     // sf->setInput(1, *batch_seqlen_tensor);
@@ -692,7 +692,7 @@ void constructNetwork(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition*
 
     // OUTPUT__1 : score, shape : [n, seqlen, 1] -> [n, seqlen]
     sf = network->addShuffle(*top_1->getOutput(0));
-    sf->setReshapeDimensions(Dims2{-1, seqlen}); // static reshape
+    sf->setReshapeDimensions(Dims2{-1, seqlen}); // static reshape for debug
 
     // sf->setInput(1, *batch_seqlen_tensor);
     sf->getOutput(0)->setName(OutputNames[1].c_str());
