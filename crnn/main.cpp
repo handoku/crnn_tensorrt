@@ -97,16 +97,16 @@ nvinfer1::ILayer* addSingleIntValueConst(INetworkDefinition *network, std::map<s
     return network->addConstant(dims, wt);
 }
 
-nvinfer1::ILayer* addAxisValue(INetworkDefinition *network, int axis, Dims dims={0})
+nvinfer1::ILayer* addIndiceValue(INetworkDefinition *network, int axis, Dims dims={0})
 {
-    assert(0 <= axis && axis <= 7 && "addAxisValue error ! axis must between 0~7");
+    assert(0 <= axis && axis <= 7 && "addIndiceValue error ! axis must between 0~7");
     Weights wt{DataType::kINT32, &INDICES[axis], 1};
     return network->addConstant(dims, wt);
 }
 
 nvinfer1::ITensor* getAxisLength(INetworkDefinition *network, ITensor* shape, int axis, Dims dims={0})
 {
-    ITensor* idx = addAxisValue(network, axis, dims)->getOutput(0);
+    ITensor* idx = addIndiceValue(network, axis, dims)->getOutput(0);
     return network->addGather(*shape, *idx, 0)->getOutput(0);
 }
 
@@ -118,7 +118,7 @@ nvinfer1::ITensor* unsqueezeTensor(INetworkDefinition *network, ITensor& input, 
 
     for(int i=0; i<dims.nbDims; i++){
         if (i == axis){
-            shape_vec.push_back(addAxisValue(network, i, Dims{1,1})->getOutput(0));
+            shape_vec.push_back(addIndiceValue(network, i, Dims{1,1})->getOutput(0));
         } else {
             shape_vec.push_back(getAxisLength(network, input_shape, i, Dims{1,1}));
         }
@@ -355,7 +355,8 @@ nvinfer1::ILayer* addBasicBlock(INetworkDefinition *network, std::map<std::strin
 }
 
 nvinfer1::ILayer* addLoopLSTMCell(INetworkDefinition *network, std::map<std::string, Weights>& weightMap,
-                                    const LstmIO& inputTensors, ITensor* seqLen, const LstmParams& params,
+                                    const LstmIO& inputTensors, ITensor* seqLen, ITensor* singleGateShape,
+                                    const LstmParams& params,
                                     LstmIO& outputTensors, std::string lname)
 {
     ILoop* loop = network->addLoop();
@@ -383,11 +384,13 @@ nvinfer1::ILayer* addLoopLSTMCell(INetworkDefinition *network, std::map<std::str
                                       ->getOutput(0);
     print_dims(" ht1RT ", ht1RT->getDimensions());
 
+    // [n, 1024]
+    ITensor* mm = network->addElementWise(*xtWT, *ht1RT, ElementWiseOperation::kSUM)->getOutput(0);
+
     // [1, 1024]
     ITensor* bias = network->addElementWise(*params.inputBias, *params.recurrentBias, ElementWiseOperation::kSUM)
               ->getOutput(0);
-    // [n, 1024]
-    ITensor* mm = network->addElementWise(*xtWT, *ht1RT, ElementWiseOperation::kSUM)->getOutput(0);
+   
 
     // [n, 1024]
     ITensor* gatesIFCO = network->addElementWise(*mm, *bias, ElementWiseOperation::kSUM)->getOutput(0);
@@ -398,11 +401,8 @@ nvinfer1::ILayer* addLoopLSTMCell(INetworkDefinition *network, std::map<std::str
         ITensor* start = addConst(network, weightMap, Dims{1,2}, std::vector<int>{0, gateIndex*params.hiddenSize}, 
                             DataType::kINT32, lname +".isolateStart"+ std::to_string(gateIndex))
                         ->getOutput(0);
-        ITensor* size = addConst(network, weightMap, Dims{1,2}, std::vector<int>{0, params.hiddenSize}, 
-                            DataType::kINT32, lname + ".isolateSize" + std::to_string(gateIndex))
-                        ->getOutput(0);
-        // slice->setInput(1 , *start); need to fix in case of dynamic shape
-        // slice->setInput(2 , *size); 
+        slice->setInput(1 , *start); 
+        slice->setInput(2 , *singleGateShape /*size*/); 
         return slice->getOutput(0);
     };
 
@@ -431,7 +431,7 @@ nvinfer1::ILayer* addLoopLSTMCell(INetworkDefinition *network, std::map<std::str
         ->getOutput(0);
 
     print_dims(" Ht ", Ht->getDimensions());
-
+    
     cell->setInput(1, *Ct);
     hidden->setInput(1, *Ht);
 
@@ -440,32 +440,28 @@ nvinfer1::ILayer* addLoopLSTMCell(INetworkDefinition *network, std::map<std::str
     outputLayer->setInput(1, *seqLen);
 
     // [n, hiddenSize]
-    // ITensor* hiddenOut = loop->addLoopOutput(*hidden->getOutput(0), nvinfer1::LoopOutput::kLAST_VALUE)->getOutput(0);
-    // ITensor* cellOut= loop->addLoopOutput(*cell->getOutput(0), nvinfer1::LoopOutput::kLAST_VALUE)->getOutput(0);
+    ITensor* hiddenOut = loop->addLoopOutput(*hidden->getOutput(0), nvinfer1::LoopOutput::kLAST_VALUE)->getOutput(0);
+    ITensor* cellOut= loop->addLoopOutput(*cell->getOutput(0), nvinfer1::LoopOutput::kLAST_VALUE)->getOutput(0);
 
-    // outputTensors = LstmIO{outputLayer->getOutput(0), hiddenOut, cellOut};
-    outputTensors = LstmIO{outputLayer->getOutput(0), nullptr, nullptr};
+    outputTensors = LstmIO{outputLayer->getOutput(0), hiddenOut, cellOut};
+    // outputTensors = LstmIO{outputLayer->getOutput(0), nullptr, nullptr};
     return outputLayer;
 }
 
 // only support undirectional forward mode;
 //TODO : support bidirectional lstm
 nvinfer1::ILayer* addLoopLSTMLayers(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, 
-                                    ITensor* input,
+                                    ITensor* input, ITensor* inputShape, ITensor* seqLen,
                                     int numLayers, int hiddenSize, int featureSize, 
                                     std::string lname)
 {
     ILayer* dataOut{nullptr};
 
-    // inputShape {seqlen, n, 512 /*featureSize*/};
-    ITensor* inputShape = network->addShape(*input)->getOutput(0);
-    ITensor* seqLen = getAxisLength(network, inputShape, 0); // scalar, zero dims
-
     auto initialStateShape = [&]() -> ITensor*{
         // axis 1's length should be batchSize
         ITensor* numLayersTensor = addSingleIntValueConst(network, weightMap, numLayers, lname + ".numLayers")->getOutput(0);
         ITensor* batchSizeTensor = getAxisLength(network, inputShape, 1, Dims{1, 1});
-        batchSizeTensor = addSingleIntValueConst(network, weightMap, 1, lname + ".batchSize")->getOutput(0);
+        // batchSizeTensor = addSingleIntValueConst(network, weightMap, 1, lname + ".batchSize")->getOutput(0);
 
         ITensor* hiddenSizeTensor = addSingleIntValueConst(network, weightMap, hiddenSize, lname + ".hiddenSize")->getOutput(0);
 
@@ -474,14 +470,16 @@ nvinfer1::ILayer* addLoopLSTMLayers(INetworkDefinition *network, std::map<std::s
         return concat->getOutput(0);
     };
 
-    ITensor* gateOutputShape = initialStateShape();
+    ITensor* stateShape = initialStateShape();
+    ITensor* idx = addConst(network, weightMap, Dims{1, 2}, std::vector<int>{1,2}, DataType::kINT32, lname+".singleGateIdx")->getOutput(0);
+    ITensor* singleGateShape = network->addGather(*stateShape, *idx, 0)->getOutput(0);
 
     // 0.0 constant
     ITensor* constant = addConst(network, weightMap, Dims{1,1}, std::vector<float>{0.0f}, DataType::kFLOAT, lname+".constantZero")
                         ->getOutput(0);
 
-    ITensor* hidden0 = constantOfShape(network, weightMap, constant, gateOutputShape, lname+".hiddenZero");
-    ITensor* cell0 = constantOfShape(network, weightMap, constant, gateOutputShape, lname+".cellZero");
+    ITensor* hidden0 = constantOfShape(network, weightMap, constant, stateShape, lname+".hiddenZero");
+    ITensor* cell0 = constantOfShape(network, weightMap, constant, stateShape, lname+".cellZero");
 
     std::vector<ITensor*> hiddenOutputs, cellOutputs;
     LstmIO lstmOutput{input, nullptr, nullptr};
@@ -503,7 +501,7 @@ nvinfer1::ILayer* addLoopLSTMLayers(INetworkDefinition *network, std::map<std::s
 
     for(int i=0; i<numLayers; i++){
         // []
-        ITensor* index = addAxisValue(network, i)->getOutput(0);
+        ITensor* index = addIndiceValue(network, i)->getOutput(0);
         ITensor* initialHidden = network->addGather(*hidden0, *index, 0)->getOutput(0);
         ITensor* initialCellState = network->addGather(*cell0, *index, 0)->getOutput(0);;
 
@@ -518,24 +516,24 @@ nvinfer1::ILayer* addLoopLSTMLayers(INetworkDefinition *network, std::map<std::s
 
         LstmParams params{weightIn, weightRec, biasIn, biasRec, seqLen, hiddenSize};
 
-        dataOut = addLoopLSTMCell(network, weightMap, lstmInput, seqLen, params, lstmOutput, lname + ".layer" + std::to_string(i));
+        dataOut = addLoopLSTMCell(network, weightMap, lstmInput, seqLen, singleGateShape, params, lstmOutput, lname + ".layer" + std::to_string(i));
 
 
         // in crnn , we don't need h_n, c_n
 
         // push_back [1, n, hiddenSize]
-        // hiddenOutputs.push_back(unsqueezeTensor(network, *lstmOutput.hidden, 0));
-        // cellOutputs.push_back(unsqueezeTensor(network, *lstmOutput.cell, 0));
+        hiddenOutputs.push_back(unsqueezeTensor(network, *lstmOutput.hidden, 0));
+        cellOutputs.push_back(unsqueezeTensor(network, *lstmOutput.cell, 0));
     }
 
-    // auto addConcatenation = [&](std::vector<ITensor*>& tensors) -> ITensor* {
-    //     auto concat = network->addConcatenation(tensors.data(), tensors.size());
-    //     concat->setAxis(0);
-    //     return concat->getOutput(0);
-    // };
+    auto addConcatenation = [&](std::vector<ITensor*>& tensors) -> ITensor* {
+        auto concat = network->addConcatenation(tensors.data(), tensors.size());
+        concat->setAxis(0);
+        return concat->getOutput(0);
+    };
 
-    // ITensor* hiddenOut = addConcatenation(hiddenOutputs);
-    // ITensor* cellOut = addConcatenation(cellOutputs);
+    ITensor* hiddenOut = addConcatenation(hiddenOutputs);
+    ITensor* cellOut = addConcatenation(cellOutputs);
 
     return dataOut;
 }
@@ -550,15 +548,15 @@ void constructNetwork(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition*
     // nvinfer1::ITensor* extra_out;
 
     // nvinfer1::ITensor* input = network->addInput(InputNames[0], dtype, nvinfer1::Dims4{-1, 3, 32, -1});
-    nvinfer1::ITensor* input = network->addInput(InputNames[0].c_str(), dtype, nvinfer1::Dims4{1, 3, 32, input_w});
+    nvinfer1::ITensor* input = network->addInput(InputNames[0].c_str(), dtype, nvinfer1::Dims4{-1, 3, 32, -1});
 
 
-    /************************************************** normalize ****************************************************************/
+    /********************************************************** normalize ****************************************************************/
 
     ILayer* x = addNormlize(network, weightMap, *input);
     
     
-    /************************************************** resnet-34 backone ********************************************************/
+    /******************************************************** resnet-34 backone ********************************************************/
     // add conv: input, outChannels, kernel, stride, padding, layername, bn, relu
     // conv1 
     x = addConv(network, weightMap, *x->getOutput(0), 32, DimsHW{3, 3}, DimsHW{1, 1}, DimsHW{1, 1}, "backbone.conv1.0", true, true);
@@ -596,7 +594,7 @@ void constructNetwork(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition*
     
     print_dims("after maxpool out 2", p->getOutput(0)->getDimensions());
 
-    /***************************************************** shape tensor for dynamic shape ****************************************************/
+    /************************************************************* shape tensor for dynamic shape *************************************************************/
 
     // shapeTensor : {n, 512, 1, seqlen}
     ITensor* tensor_size = network->addShape(*p->getOutput(0))->getOutput(0);
@@ -606,40 +604,57 @@ void constructNetwork(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition*
 
     // squeeze + transpose, nchw -> nwc, h = 1, w = sequence_len, c = featureSize, [seqlen, n, 512]
     IShuffleLayer* sfl = network->addShuffle(*p->getOutput(0));
-    // sfl->setInput(1, *new_shape);
-    sfl->setReshapeDimensions(Dims3{1, 512, 64});
+    sfl->setInput(1, *new_shape);
+    // sfl->setReshapeDimensions(Dims3{1, 512, 64}); // static reshape
     sfl->setSecondTranspose(Permutation{2, 0, 1});
     sfl->setName("sfl");
     print_dims("lstm1 input", sfl->getOutput(0)->getDimensions());
 
 
     idxs = addConst(network, weightMap, Dims{1, 2}, std::vector<int>{0, 3}, DataType::kINT32, "idxs_2")->getOutput(0);
-     // batch_seqlen_tensor, values: {n, seqlen}, dims: {nbDims=1, d={2}}, 
+     // batch_seqlen_tensor : {n, seqlen}
     ITensor* batch_seqlen_tensor = network->addGather(*tensor_size, *idxs, 0)->getOutput(0);
 
 
-    /************************************************** lstm head *************************************************************/
+    // inputShape {seqlen, n, 512 /*featureSize*/};
+    ITensor* lstmInputShape = network->addShape(*sfl->getOutput(0))->getOutput(0);
+    ITensor* seqLen = getAxisLength(network, lstmInputShape, 0); // scalar, zero dims
+
+    ITensor* starts = addConst(network, weightMap, Dims{1, 2}, std::vector<int>{0, 0}, DataType::kINT32, "sliceStarts")->getOutput(0);
+    ITensor* startSeq = network->addElementWise(
+                                *getAxisLength(network, lstmInputShape, 0, Dims{1,1}), 
+                                *addIndiceValue(network, 1, Dims{1, 1})->getOutput(0), 
+                                ElementWiseOperation::kSUB)->getOutput(0);
+    std::array<ITensor*, 2> startsArr{startSeq, starts};
+    ITensor* sliceStarts = network->addConcatenation(startsArr.data(), startsArr.size())->getOutput(0);
+    print_dims("sliceStarts -> ", sliceStarts->getDimensions());
+
+
+    /******************************************************************* lstm head *****************************************************************************************/
+
     // lstm 1 out: [seqlen, n, 256 /*hiddenSize*/ ]
-    ILayer* lstm1 = addLoopLSTMLayers(network, weightMap, sfl->getOutput(0), 2 /*numLayers*/, 256 /*hidden_size*/, FeatureSize /*512*/, "head.lstm1");
+    ILayer* lstm1 = addLoopLSTMLayers(network, weightMap, sfl->getOutput(0), lstmInputShape, seqLen, 2 /*numLayers*/, 256 /*hidden_size*/, FeatureSize /*512*/, "head.lstm1");
     print_dims("lstm1 out", lstm1->getOutput(0)->getDimensions());
+
+    ITensor* sliceStride = addConst(network, weightMap, Dims{1,3}, std::vector<int>{-1, 1, 1}, DataType::kINT32, "lstm2.outSliceSize")->getOutput(0);
     
     // lstm 2 , need reverse input and output
-    ITensor* slice_size = network->addShape(*sfl->getOutput(0))->getOutput(0);
     auto slice = network->addSlice(*sfl->getOutput(0), Dims3{63, 0, 0}, Dims3{seqlen, 1, FeatureSize}, Dims3{-1, 1, 1});
     assert(slice && "add slice 1 error");
-    slice->setMode(SliceMode::kWRAP);
-    // slice->setInput(2, *slice_size);
+    slice->setInput(1, *sliceStarts);
+    slice->setInput(2, *lstmInputShape);
+    
     print_dims("lstm2 input ", slice->getOutput(0)->getDimensions());
     
     // out : [seqlen, n, 256 /*hiddenSize*/ ]
-    ILayer* lstm2 = addLoopLSTMLayers(network, weightMap, slice->getOutput(0), 2 /*numLayers*/, 256 /*hidden_size*/, FeatureSize /*512*/, "head.lstm2");
+    ILayer* lstm2 = addLoopLSTMLayers(network, weightMap, slice->getOutput(0), lstmInputShape, seqLen, 2 /*numLayers*/, 256 /*hidden_size*/, FeatureSize /*512*/, "head.lstm2");
     print_dims("lstm2 output ", lstm2->getOutput(0)->getDimensions());
 
     slice = network->addSlice(*lstm2->getOutput(0), Dims3{63, 0, 0}, Dims3{seqlen, 1, 256 /*hiddenSize*/}, Dims3{-1, 1, 1});
     assert(slice && "add slice 2 error");
-    slice->setMode(SliceMode::kWRAP);
-    slice_size = network->addShape(*lstm2->getOutput(0))->getOutput(0);
-    // slice->setInput(2, *slice_size);
+    ITensor* lstmOutShape = network->addShape(*lstm2->getOutput(0))->getOutput(0);
+    slice->setInput(1, *sliceStarts);
+    slice->setInput(2, *lstmOutShape);
 
     // concat [seqlen, n, 256] [seqlen, n, 256] => [seqlen, n, 512]
     std::array<ITensor*, 2> tensors{lstm1->getOutput(0), slice->getOutput(0)};
@@ -662,12 +677,12 @@ void constructNetwork(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition*
     ///****/ dynamic reshape: [n*seqlen, NumClasses, 1, 1] -> [n, seqlen, NumClasses]
     auto sfl_3 = network->addShuffle(*x->getOutput(0));
     sfl_3->setName("sfl_3");
-    sfl_3->setReshapeDimensions(Dims3{-1, seqlen, NumClasses}); //static reshape for debug
+    // sfl_3->setReshapeDimensions(Dims3{-1, seqlen, NumClasses}); //static reshape
 
     ITensor* const_num_classes_ts = addSingleIntValueConst(network, weightMap, NumClasses, "const_num_classes_ts")->getOutput(0);
     std::array<ITensor*, 2> shape_tensors = {{batch_seqlen_tensor, const_num_classes_ts}};
     ITensor* fc_shape_tensor = network->addConcatenation(shape_tensors.data(), shape_tensors.size())->getOutput(0);
-    // sfl_3->setInput(1, *fc_shape_tensor);
+    sfl_3->setInput(1, *fc_shape_tensor);
     print_dims("after shuffle 3", sfl_3->getOutput(0)->getDimensions());
 
     // softmax : shape [n, seqlen, NumClasses]
@@ -681,22 +696,27 @@ void constructNetwork(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition*
     // OUTPUT__0 : idx, shape : [n, seqlen, 1] -> [n, seqlen]
     auto sf = network->addShuffle(*top_1->getOutput(1));
     sf->setName("sf");
-    sf->setReshapeDimensions(Dims2{-1, seqlen}); // static reshape for debug
+    // sf->setReshapeDimensions(Dims2{-1, seqlen}); // static reshape
 
     // dynamic reshape
-    // sf->setInput(1, *batch_seqlen_tensor);
-    sf->getOutput(0)->setName(OutputNames[0].c_str());
-    network->markOutput(*sf->getOutput(0));
+    sf->setInput(1, *batch_seqlen_tensor);
+    // sf->getOutput(0)->setName(OutputNames[0].c_str());
+    // network->markOutput(*sf->getOutput(0));
+    x = network->addIdentity(*sf->getOutput(0));
+    x->getOutput(0)->setName(OutputNames[0].c_str());
+    network->markOutput( *x->getOutput(0) );
     print_dims("idx output ", sf->getOutput(0)->getDimensions());
 
 
     // OUTPUT__1 : score, shape : [n, seqlen, 1] -> [n, seqlen]
     sf = network->addShuffle(*top_1->getOutput(0));
-    sf->setReshapeDimensions(Dims2{-1, seqlen}); // static reshape for debug
-
-    // sf->setInput(1, *batch_seqlen_tensor);
-    sf->getOutput(0)->setName(OutputNames[1].c_str());
-    network->markOutput(*sf->getOutput(0));
+    // sf->setReshapeDimensions(Dims2{-1, seqlen}); // static reshape
+    sf->setInput(1, *batch_seqlen_tensor);
+    // sf->getOutput(0)->setName(OutputNames[1].c_str());
+    // network->markOutput(*sf->getOutput(0));
+    x = network->addIdentity(*sf->getOutput(0));
+    x->getOutput(0)->setName(OutputNames[1].c_str());
+    network->markOutput( *x->getOutput(0) );
     print_dims("score output ", sf->getOutput(0)->getDimensions());
 
     // extra_out : for debug
@@ -725,14 +745,14 @@ void APIToModel(unsigned int maxBatchSize) {
     config->setMaxWorkspaceSize(12LL * (1<<30));
 
     // optimize profile
-    const int profile_num = 1;
+    const int profileNum = 1;
     // nvinfer1::Dims4 mi[] = {nvinfer1::Dims4{1, 3, 32, 32}, };
     // nvinfer1::Dims4 opt[] = {nvinfer1::Dims4{4, 3, 32, 256}, };
     // nvinfer1::Dims4 mx[] = {nvinfer1::Dims4{maxBatchSize, 3, 32, 512}, };
-    nvinfer1::Dims4 mi[] = {nvinfer1::Dims4{1, 3, 32, 256}, };
+    nvinfer1::Dims4 mi[] = {nvinfer1::Dims4{1, 3, 32, 32}, };
     nvinfer1::Dims4 opt[] = {nvinfer1::Dims4{1, 3, 32, 256}, };
-    nvinfer1::Dims4 mx[] = {nvinfer1::Dims4{1, 3, 32, 256}, };
-    for (int i=0; i<profile_num; i++){
+    nvinfer1::Dims4 mx[] = {nvinfer1::Dims4{1, 3, 32, 512}, };
+    for (int i=0; i<profileNum; i++){
         auto profile = builder->createOptimizationProfile();
         profile->setDimensions(network->getInput(0)->getName(), OptProfileSelector::kMIN, mi[i]);
         profile->setDimensions(network->getInput(0)->getName(), OptProfileSelector::kOPT, opt[i]);
@@ -742,9 +762,11 @@ void APIToModel(unsigned int maxBatchSize) {
 
     // build engine
     std::cout << "step 3 : building engine, please wait for a while...\n";
+    auto start_time = std::chrono::system_clock::now();
     nvinfer1::ICudaEngine* engine = builder->buildEngineWithConfig(*network, *config);
     assert(engine != nullptr && "build engine error ! ");
-    std::cout << "Build engine successfully! \n";
+    auto end_time = std::chrono::system_clock::now();
+    std::cout <<"Build engine successfully! Time cost : "<< (std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() * 1.0)/1000 << " s\n";
 
     // Serialize the engine
     nvinfer1::IHostMemory* modelStream = engine->serialize();
